@@ -1,0 +1,168 @@
+import numpy as np
+import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+
+
+# Load the data
+y_train = pd.read_csv('y_train.csv')
+X1_train = pd.read_csv('X1_train.csv')
+X2_train = pd.read_csv('X2_train.csv')
+X3_train = pd.read_csv('X3_train.csv')
+X1_test = pd.read_csv('X1_test.csv')
+X2_test = pd.read_csv('X2_test.csv')
+X3_test = pd.read_csv('X3_test.csv')
+
+
+# Define the imputers
+imputer_median = SimpleImputer(strategy='median')
+imputer_most_frequent = SimpleImputer(strategy='most_frequent')
+
+# Function to aggregate data
+def aggregate_data(df):
+    df_numeric = df.select_dtypes(include=["float64", "int64"])
+    df_numeric = df_numeric.groupby(df_numeric.index).mean()
+    df_categorical = df.select_dtypes(include=["object"])
+    df_categorical = df_categorical.groupby(df_categorical.index).agg(lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0])
+    return pd.concat([df_numeric, df_categorical], axis=1)
+
+# Aggregate X2 data
+X2_train_aggregated = aggregate_data(X2_train.set_index('客户编号'))
+X2_test_aggregated = aggregate_data(X2_test.set_index('客户编号'))
+
+# 使用 'merge' 和 'inner' 连接来合并数据集，确保只包括在所有数据集中都存在的 '客户编号'
+train_data_combined = X1_train.merge(X2_train_aggregated, on='客户编号', how='inner').merge(X3_train, on='客户编号', how='inner')
+test_data_combined = X1_test.merge(X2_test_aggregated, on='客户编号', how='inner').merge(X3_test, on='客户编号', how='inner')
+
+# Redefine columns
+numeric_columns_combined = train_data_combined.select_dtypes(include=['int64', 'float64']).columns.tolist()
+categorical_columns_combined = train_data_combined.select_dtypes(include=['object']).columns.tolist()
+
+
+# Identify columns with all NaN values
+columns_with_all_nan = train_data_combined.columns[train_data_combined.isna().all()]
+
+# Identify numeric columns that are not all NaN
+valid_numeric_columns = [col for col in numeric_columns_combined if col not in columns_with_all_nan]
+
+# Perform the imputation
+imputed_data = imputer_median.fit_transform(train_data_combined[valid_numeric_columns])
+
+# Convert the numpy array back to a dataframe
+imputed_df = pd.DataFrame(imputed_data, columns=valid_numeric_columns)
+
+# Re-add the columns that were all NaN, if any
+for col in columns_with_all_nan:
+    imputed_df[col] = np.nan
+
+# Now, try assigning the data back to the original dataframe
+for col in imputed_df.columns:
+    train_data_combined[col] = imputed_df[col]
+
+# 使用相同的imputer对训练和测试数据进行缺失值填充
+train_data_combined[valid_numeric_columns] = imputer_median.transform(train_data_combined[valid_numeric_columns])
+test_data_combined[valid_numeric_columns] = imputer_median.transform(test_data_combined[valid_numeric_columns])
+
+# 在训练数据上拟合imputer_most_frequent
+imputer_most_frequent.fit(train_data_combined[categorical_columns_combined])
+
+# 对训练和测试数据重新应用分类列的imputer
+train_data_combined[categorical_columns_combined] = imputer_most_frequent.transform(train_data_combined[categorical_columns_combined])
+test_data_combined[categorical_columns_combined] = imputer_most_frequent.transform(test_data_combined[categorical_columns_combined])
+
+
+# Check for missing values
+missing_after_aggregation_correction = {
+    "train": train_data_combined.isnull().sum().sum(),
+    "test": test_data_combined.isnull().sum().sum()
+}
+
+# One-hot encoding
+categorical_columns_final = train_data_combined.select_dtypes(include=['object']).columns.tolist()
+encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
+train_encoded = pd.DataFrame(encoder.fit_transform(train_data_combined[categorical_columns_final]))
+test_encoded = pd.DataFrame(encoder.transform(test_data_combined[categorical_columns_final]))
+train_encoded.index = train_data_combined.index
+test_encoded.index = test_data_combined.index
+train_encoded.columns = encoder.get_feature_names_out(categorical_columns_final)
+test_encoded.columns = encoder.get_feature_names_out(categorical_columns_final)
+train_final = pd.concat([train_data_combined[train_data_combined.columns.difference(categorical_columns_final)], train_encoded], axis=1)
+test_final = pd.concat([test_data_combined[test_data_combined.columns.difference(categorical_columns_final)], test_encoded], axis=1)
+
+
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+
+# Fill missing values with a constant
+train_final_filled = train_final.fillna(0)
+test_final_filled = test_final.fillna(0)
+
+# Initialize the scaler
+scaler = StandardScaler()
+
+# Fit the scaler on the training data, excluding '客户编号'
+scaler.fit(train_final_filled.drop('客户编号', axis=1))
+
+# Scale both the training and test datasets
+train_scaled = scaler.transform(train_final_filled.drop('客户编号', axis=1))
+test_scaled = scaler.transform(test_final_filled.drop('客户编号', axis=1))
+
+# Convert arrays back to dataframes
+train_scaled_df = pd.DataFrame(train_scaled, columns=train_final_filled.columns.drop('客户编号'))
+test_scaled_df = pd.DataFrame(test_scaled, columns=test_final_filled.columns.drop('客户编号'))
+
+# Add '客户编号' back to the scaled dataframes
+train_scaled_df['客户编号'] = train_final_filled['客户编号'].values
+test_scaled_df['客户编号'] = test_final_filled['客户编号'].values
+
+# Feature Selection: Remove low-variance features
+X_train = train_scaled_df.drop('客户编号', axis=1)
+thresholder = VarianceThreshold(threshold=0)
+X_train_high_variance = thresholder.fit_transform(X_train)
+high_variance_features = X_train.columns[thresholder.get_support()]
+
+# Apply the same transformation to the test data
+X_test_high_variance = thresholder.transform(test_scaled_df.drop('客户编号', axis=1))
+
+# Prepare the data (features and target variable)
+y_train_data = y_train.set_index('客户编号')
+y_train_matched = y_train_data.loc[train_scaled_df['客户编号']]
+y_train_final = y_train_matched['复购频率']
+
+# Initialize and train the model
+model = RandomForestClassifier(random_state=0)
+model.fit(X_train_high_variance, y_train_final)
+
+# Make predictions on the test set
+predictions = model.predict(X_test_high_variance)
+
+# Create a DataFrame for the predictions
+predictions_df = pd.DataFrame(predictions, columns=['复购频率'])
+
+# 假设 predictions_df 已经包含了模型为测试集生成的预测
+
+# 获取原始测试集中的所有客户编号
+original_test_ids = X1_test['客户编号']
+
+# 获取模型预测中存在的客户编号
+predicted_ids = test_data_combined['客户编号']  # 或者任何包含预测的客户编号的变量
+
+# 找出缺失的客户编号
+missing_ids = set(original_test_ids) - set(predicted_ids)
+
+# 计算复购频率列的众数
+mode_prediction = predictions_df['复购频率'].mode().iloc[0]
+
+# 创建包含缺失客户编号及其预测的数据框，使用众数填充
+missing_predictions_df = pd.DataFrame({
+    '复购频率': [mode_prediction] * len(missing_ids)
+})
+
+# 将缺失的预测与原始预测合并
+final_predictions_df = pd.concat([predictions_df, missing_predictions_df])
+
+# 现在 final_predictions_df 包含了所有客户编号的预测，我们可以将其保存为输出文件
+final_predictions_df.to_excel('./output/predict.xlsx', index=False)
